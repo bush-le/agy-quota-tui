@@ -106,8 +106,8 @@ Developers running multiple **Google Antigravity CLI (`agy`)** subscriptions—s
 ### Build & Install (`~/.local/bin`)
 
 ```bash
-git clone https://github.com/<your-username>/agy-tui.git
-cd agy-tui
+git clone https://github.com/<your-username>/agy-quota-tui.git
+cd agy-quota-tui
 ./install.sh
 ```
 
@@ -274,7 +274,7 @@ To customize account labels or define profiles explicitly, create `~/.config/agy
 ## Repository Structure
 
 ```text
-agy-tui/
+agy-quota-tui/
 ├── .gitignore          # Strict secret, build artifact & local audit exclusion rules
 ├── Cargo.toml          # Crate metadata & minimal dependency list
 ├── Cargo.lock          # SHA-256 pinned crate checksums
