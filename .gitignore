@@ -1,0 +1,61 @@
+# =============================================================================
+# agy-top (.gitignore) — Strict Open-Source Rust Security & Hygiene Rules
+# =============================================================================
+
+# 1. Rust Build & Profiling Artifacts (NEVER COMMIT)
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+lcov.info
+
+# 2. Local Security Scanner, Audit Scripts & Test Suites (Keep Local Only)
+/scripts/
+/tests/
+SECURITY.md
+
+# 3. Credentials, OAuth Tokens, Keys & Local State (CRITICAL — NEVER COMMIT)
+.env
+.env.*
+.envrc
+.direnv/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.der
+*oauth*
+*token*
+*secret*
+*credential*
+*keyring*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+quota-cache.json
+cache.json
+agy-quota-cache.json
+config.json
+profiles.json
+*.local.json
+.gemini/
+.gemini-*/
+.agy-profile*/
+
+# 4. IDE, Editor & OS Metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+scratch/
