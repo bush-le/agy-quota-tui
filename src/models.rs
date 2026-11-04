@@ -61,7 +61,7 @@ impl BucketQuota {
         Some((ep - now_epoch).max(0.0))
     }
 
-    pub fn format_countdown(&self, now_epoch: f64, include_seconds: bool) -> String {
+    pub fn format_countdown(&self, now_epoch: f64, _include_seconds: bool) -> String {
         let Some(secs) = self.seconds_until_reset(now_epoch) else {
             return "—".to_string();
         };
@@ -75,20 +75,15 @@ impl BucketQuota {
         let hours = rem1 / 3_600;
         let rem2 = rem1 % 3_600;
         let minutes = rem2 / 60;
-        let seconds = rem2 % 60;
 
         if days > 0 {
             format!("{days}d {hours:02}h {minutes:02}m")
         } else if hours > 0 {
-            if include_seconds {
-                format!("{hours}h {minutes:02}m {seconds:02}s")
-            } else {
-                format!("{hours}h {minutes:02}m")
-            }
-        } else if include_seconds {
-            format!("{minutes:02}m {seconds:02}s")
-        } else {
+            format!("{hours}h {minutes:02}m")
+        } else if minutes > 0 {
             format!("{minutes}m")
+        } else {
+            "<1m".to_string()
         }
     }
 

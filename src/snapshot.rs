@@ -50,7 +50,7 @@ fn format_bucket_reset_ansi(bucket: &BucketQuota, now_epoch: f64) -> String {
     if bucket.window == "5h" && bucket.is_full() {
         return format!("{DIM}{FG_LIME}Ready (5h){RESET}");
     }
-    let cd = bucket.format_countdown(now_epoch, true);
+    let cd = bucket.format_countdown(now_epoch, false);
     let local = bucket.format_local_reset();
     if local.is_empty() {
         format!("{FG_CYAN}Reset: {cd}{RESET}")

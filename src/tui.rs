@@ -236,7 +236,7 @@ fn build_reset_line(bucket: &BucketQuota, now_epoch: f64, pal: &ThemePalette) ->
             Span::styled("Ready (5h)", Style::default().fg(pal.best)),
         ]);
     }
-    let cd = bucket.format_countdown(now_epoch, true);
+    let cd = bucket.format_countdown(now_epoch, false);
     let local = bucket.format_local_reset();
     let mut spans = vec![
         Span::raw("    "),
