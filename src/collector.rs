@@ -17,8 +17,9 @@ use crate::models::{
 };
 use crate::profiles::locate_agy_binary;
 use crate::security::{
-    atomic_write_json, build_isolated_command, get_safe_cache_dir, get_safe_empty_workspace,
-    kill_process_group, redact_sensitive_text, safe_read_json, sanitize_terminal_text,
+    atomic_write_json, build_isolated_command, build_isolated_prime_command, get_safe_cache_dir,
+    get_safe_empty_workspace, kill_process_group, redact_sensitive_text, safe_read_json,
+    sanitize_terminal_text,
 };
 
 pub const MAX_SUBPROCESS_OUTPUT_BYTES: u64 = 262_144; // 256 KB hard cap
@@ -230,61 +231,22 @@ pub fn parse_usage_json(
     }
 }
 
-/// Execute a single isolated `agy -p /usage` query with bounded output reading and timeout reaping.
-pub fn fetch_single_profile(
-    profile: &ProfileSpec,
-    agy_bin: &Path,
+fn run_bounded_subprocess(
+    argv: &[String],
+    clean_env: &std::collections::BTreeMap<String, String>,
     empty_cwd: &Path,
-    real_home: Option<&Path>,
-) -> AccountSnapshot {
-    let now = now_epoch_secs();
-    let (argv, clean_env) = match build_isolated_command(
-        &profile.mode,
-        agy_bin,
-        Path::new(&profile.home_dir),
-        profile.container.as_deref(),
-        real_home,
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            return AccountSnapshot {
-                profile_id: profile.id.clone(),
-                label: profile.label.clone(),
-                command_hint: profile.command_hint.clone(),
-                mode: profile.mode.clone(),
-                ok: false,
-                fetched_at_epoch: now,
-                groups: Vec::new(),
-                error: redact_sensitive_text(&e.to_string(), 240),
-            };
-        }
-    };
-
-    let mut child = match Command::new(&argv[0])
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(empty_cwd)
         .env_clear()
-        .envs(&clean_env)
+        .envs(clean_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return AccountSnapshot {
-                profile_id: profile.id.clone(),
-                label: profile.label.clone(),
-                command_hint: profile.command_hint.clone(),
-                mode: profile.mode.clone(),
-                ok: false,
-                fetched_at_epoch: now_epoch_secs(),
-                groups: Vec::new(),
-                error: redact_sensitive_text(&format!("Spawn error: {e}"), 240),
-            };
-        }
-    };
+        .map_err(|e| format!("Spawn error: {e}"))?;
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -326,24 +288,57 @@ pub fn fetch_single_profile(
     let stdout_bytes = out_handle.join().unwrap_or_default();
     let stderr_bytes = err_handle.join().unwrap_or_default();
 
-    let exit_status = match status {
-        Ok(st) => st,
-        Err(err_msg) => {
+    let exit_status = status?;
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    Ok((exit_status, stdout_str, stderr_str))
+}
+
+fn query_usage_once(
+    profile: &ProfileSpec,
+    agy_bin: &Path,
+    empty_cwd: &Path,
+    real_home: Option<&Path>,
+) -> AccountSnapshot {
+    let now = now_epoch_secs();
+    let (argv, clean_env) = match build_isolated_command(
+        &profile.mode,
+        agy_bin,
+        Path::new(&profile.home_dir),
+        profile.container.as_deref(),
+        real_home,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
             return AccountSnapshot {
                 profile_id: profile.id.clone(),
                 label: profile.label.clone(),
                 command_hint: profile.command_hint.clone(),
                 mode: profile.mode.clone(),
                 ok: false,
-                fetched_at_epoch: now_epoch_secs(),
+                fetched_at_epoch: now,
                 groups: Vec::new(),
-                error: redact_sensitive_text(&err_msg, 240),
+                error: redact_sensitive_text(&e.to_string(), 240),
             };
         }
     };
 
-    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
-    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    let (exit_status, stdout_str, stderr_str) =
+        match run_bounded_subprocess(&argv, &clean_env, empty_cwd) {
+            Ok(res) => res,
+            Err(err_msg) => {
+                return AccountSnapshot {
+                    profile_id: profile.id.clone(),
+                    label: profile.label.clone(),
+                    command_hint: profile.command_hint.clone(),
+                    mode: profile.mode.clone(),
+                    ok: false,
+                    fetched_at_epoch: now_epoch_secs(),
+                    groups: Vec::new(),
+                    error: redact_sensitive_text(&err_msg, 240),
+                };
+            }
+        };
 
     if !exit_status.success() && !stdout_str.contains('{') {
         let combined = if !stderr_str.trim().is_empty() {
@@ -366,6 +361,81 @@ pub fn fetch_single_profile(
     }
 
     parse_usage_json(&stdout_str, profile, Some(now_epoch_secs()))
+}
+
+fn prime_single_group(
+    profile: &ProfileSpec,
+    agy_bin: &Path,
+    empty_cwd: &Path,
+    model_name: &str,
+    real_home: Option<&Path>,
+) -> bool {
+    let Ok((argv, clean_env)) = build_isolated_prime_command(
+        &profile.mode,
+        agy_bin,
+        Path::new(&profile.home_dir),
+        profile.container.as_deref(),
+        model_name,
+        real_home,
+    ) else {
+        return false;
+    };
+
+    match run_bounded_subprocess(&argv, &clean_env, empty_cwd) {
+        Ok((status, stdout_str, _)) => status.success() || stdout_str.contains("\"SUCCESS\""),
+        Err(_) => false,
+    }
+}
+
+/// Execute a single isolated `agy -p /usage` query with bounded output reading, auto-priming any
+/// 100% (`1.0`) unprimed quota groups and re-querying immediately so the reset countdown runs.
+pub fn fetch_single_profile(
+    profile: &ProfileSpec,
+    agy_bin: &Path,
+    empty_cwd: &Path,
+    real_home: Option<&Path>,
+) -> AccountSnapshot {
+    let initial = query_usage_once(profile, agy_bin, empty_cwd, real_home);
+    if !initial.ok {
+        return initial;
+    }
+
+    let models_to_prime: Vec<&'static str> = initial
+        .groups
+        .iter()
+        .filter(|g| g.needs_priming())
+        .filter_map(|g| g.priming_model())
+        .collect();
+
+    if models_to_prime.is_empty() {
+        return initial;
+    }
+
+    let mut any_primed = false;
+    for model_name in models_to_prime {
+        let mut primed = prime_single_group(profile, agy_bin, empty_cwd, model_name, real_home);
+        if !primed && model_name == "GPT-OSS 120B (Medium)" {
+            primed = prime_single_group(
+                profile,
+                agy_bin,
+                empty_cwd,
+                "Claude Sonnet 5.5 (Low)",
+                real_home,
+            );
+        }
+        if primed {
+            any_primed = true;
+        }
+    }
+
+    if any_primed {
+        let refreshed = query_usage_once(profile, agy_bin, empty_cwd, real_home);
+        if refreshed.ok {
+            return refreshed;
+        }
+    }
+
+    initial
 }
 
 /// Compute the optimal account to use right now for Gemini and Claude/GPT.

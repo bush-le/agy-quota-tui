@@ -53,7 +53,7 @@ impl BucketQuota {
     }
 
     pub fn is_full(&self) -> bool {
-        safe_fraction(self.remaining_fraction) >= 0.995
+        safe_fraction(self.remaining_fraction) >= 1.0
     }
 
     pub fn seconds_until_reset(&self, now_epoch: f64) -> Option<f64> {
@@ -162,6 +162,36 @@ impl GroupQuota {
 
     pub fn get_bucket_by_window(&self, window: &str) -> Option<&BucketQuota> {
         self.buckets.iter().find(|b| b.window == window)
+    }
+
+    /// Return true if any bucket in this group is completely unprimed (`1.0`),
+    /// provided no bucket in the same group is completely exhausted (`<= 0.0`).
+    pub fn needs_priming(&self) -> bool {
+        if self.buckets.is_empty() {
+            return false;
+        }
+        let any_exhausted = self
+            .buckets
+            .iter()
+            .any(|b| safe_fraction(b.remaining_fraction) <= 0.0);
+        if any_exhausted {
+            return false;
+        }
+        self.buckets.iter().any(BucketQuota::is_full)
+    }
+
+    /// Return the lightest model identifier for priming this quota group's timer.
+    pub fn priming_model(&self) -> Option<&'static str> {
+        let lower = self.name.to_ascii_lowercase();
+        if lower.contains("argon") {
+            Some("Gemini 4 Argon (Low)")
+        } else if lower.contains("gemini") {
+            Some("Gemini 3.8 Flash (Low)")
+        } else if lower.contains("claude") || lower.contains("gpt") {
+            Some("GPT-OSS 120B (Medium)")
+        } else {
+            None
+        }
     }
 
     pub fn from_json_value(v: &Value) -> Option<Self> {

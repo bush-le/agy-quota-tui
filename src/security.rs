@@ -849,33 +849,24 @@ pub fn build_host_env(real_home: Option<&Path>) -> Result<BTreeMap<String, Strin
     Ok(env_map)
 }
 
-/// Construct verified `(argv, clean_env)` for executing `agy -p /usage` safely.
-pub fn build_isolated_command(
+pub const ALLOWED_PRIMING_MODELS: [&str; 4] = [
+    "Gemini 3.8 Flash (Low)",
+    "GPT-OSS 120B (Medium)",
+    "Claude Sonnet 5.5 (Low)",
+    "Gemini 4 Argon (Low)",
+];
+
+fn wrap_agy_invocation(
     mode: &str,
-    agy_bin: &Path,
-    home_dir: &Path,
+    agy_args: Vec<String>,
+    verified_home: &Path,
     container_name: Option<&str>,
     real_home: Option<&Path>,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), SecurityError> {
-    let verified_agy = verify_safe_executable(agy_bin)?;
-    let verified_home = verify_safe_home_dir(home_dir, real_home)?;
     let username = get_current_username();
-
-    let agy_args = vec![
-        verified_agy.to_string_lossy().into_owned(),
-        "--log-file".to_string(),
-        "/dev/null".to_string(),
-        "--print-timeout".to_string(),
-        "25s".to_string(),
-        "-p".to_string(),
-        "/usage".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-    ];
-
     match mode {
         "host" => {
-            let host_env = build_host_env(Some(&verified_home))?;
+            let host_env = build_host_env(Some(verified_home))?;
             Ok((agy_args, host_env))
         }
         "isolated_home" => {
@@ -907,7 +898,7 @@ pub fn build_isolated_command(
             let mut outer_env = build_host_env(real_home)?;
             outer_env.remove("DBUS_SESSION_BUS_ADDRESS");
 
-            let mut cmd = Vec::with_capacity(24);
+            let mut cmd = Vec::with_capacity(28);
             cmd.push(runner_bin.to_string_lossy().into_owned());
             if mode == "toolbox" {
                 cmd.push("run".to_string());
@@ -936,6 +927,67 @@ pub fn build_isolated_command(
             "Unsupported profile execution mode: {other}"
         ))),
     }
+}
+
+/// Construct verified `(argv, clean_env)` for executing `agy -p /usage` safely.
+pub fn build_isolated_command(
+    mode: &str,
+    agy_bin: &Path,
+    home_dir: &Path,
+    container_name: Option<&str>,
+    real_home: Option<&Path>,
+) -> Result<(Vec<String>, BTreeMap<String, String>), SecurityError> {
+    let verified_agy = verify_safe_executable(agy_bin)?;
+    let verified_home = verify_safe_home_dir(home_dir, real_home)?;
+
+    let agy_args = vec![
+        verified_agy.to_string_lossy().into_owned(),
+        "--log-file".to_string(),
+        "/dev/null".to_string(),
+        "--print-timeout".to_string(),
+        "25s".to_string(),
+        "-p".to_string(),
+        "/usage".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+    ];
+
+    wrap_agy_invocation(mode, agy_args, &verified_home, container_name, real_home)
+}
+
+/// Construct verified `(argv, clean_env)` for priming a 100% quota bucket with a minimal prompt.
+pub fn build_isolated_prime_command(
+    mode: &str,
+    agy_bin: &Path,
+    home_dir: &Path,
+    container_name: Option<&str>,
+    model_name: &str,
+    real_home: Option<&Path>,
+) -> Result<(Vec<String>, BTreeMap<String, String>), SecurityError> {
+    if !ALLOWED_PRIMING_MODELS.contains(&model_name) {
+        return Err(SecurityError(format!(
+            "Disallowed priming model: {model_name}"
+        )));
+    }
+    let verified_agy = verify_safe_executable(agy_bin)?;
+    let verified_home = verify_safe_home_dir(home_dir, real_home)?;
+
+    let agy_args = vec![
+        verified_agy.to_string_lossy().into_owned(),
+        "--log-file".to_string(),
+        "/dev/null".to_string(),
+        "--print-timeout".to_string(),
+        "25s".to_string(),
+        "--disable-slash-commands".to_string(),
+        "--model".to_string(),
+        model_name.to_string(),
+        "-p".to_string(),
+        "hi".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+    ];
+
+    wrap_agy_invocation(mode, agy_args, &verified_home, container_name, real_home)
 }
 
 /// Atomically write JSON bytes into a validated `0700` directory using `O_EXCL | O_NOFOLLOW` (`0600`).
