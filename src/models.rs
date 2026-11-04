@@ -159,20 +159,12 @@ impl GroupQuota {
         self.buckets.iter().find(|b| b.window == window)
     }
 
-    /// Return true if any bucket in this group is completely unprimed (`1.0`),
-    /// provided no bucket in the same group is completely exhausted (`<= 0.0`).
+    /// Return true ONLY if a `weekly` bucket in this group is completely unprimed (`1.0`).
+    /// 5h buckets do not trigger auto-priming on their own.
     pub fn needs_priming(&self) -> bool {
-        if self.buckets.is_empty() {
-            return false;
-        }
-        let any_exhausted = self
-            .buckets
+        self.buckets
             .iter()
-            .any(|b| safe_fraction(b.remaining_fraction) <= 0.0);
-        if any_exhausted {
-            return false;
-        }
-        self.buckets.iter().any(BucketQuota::is_full)
+            .any(|b| b.window == "weekly" && b.is_full())
     }
 
     /// Return the lightest model identifier for priming this quota group's timer.
