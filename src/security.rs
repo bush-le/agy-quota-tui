@@ -990,6 +990,137 @@ pub fn build_isolated_prime_command(
     wrap_agy_invocation(mode, agy_args, &verified_home, container_name, real_home)
 }
 
+/// Validate that a conversation ID is a canonical lowercase/uppercase ASCII hex UUID
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) to prevent path traversal when purging priming artifacts.
+pub fn validate_uuid<'a>(value: &'a str) -> Result<&'a str, SecurityError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return Err(SecurityError(
+            "Invalid conversation UUID length".to_string(),
+        ));
+    }
+    for (idx, &b) in bytes.iter().enumerate() {
+        let should_be_dash = matches!(idx, 8 | 13 | 18 | 23);
+        if should_be_dash {
+            if b != b'-' {
+                return Err(SecurityError("Invalid conversation UUID format".to_string()));
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return Err(SecurityError(
+                "Invalid character in conversation UUID".to_string(),
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn remove_owned_regular_file(path: &Path, expected_uid: u32) {
+    if let Ok(lst) = fs::symlink_metadata(path) {
+        if !lst.file_type().is_symlink() && lst.file_type().is_file() && lst.uid() == expected_uid {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn remove_owned_dir_recursive(path: &Path, expected_uid: u32, max_depth: u8) {
+    if max_depth == 0 {
+        return;
+    }
+    let Ok(lst) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if lst.file_type().is_symlink() || !lst.file_type().is_dir() || lst.uid() != expected_uid {
+        return;
+    }
+    if let Ok(rd) = fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let child_path = entry.path();
+            if let Ok(clst) = fs::symlink_metadata(&child_path) {
+                if clst.uid() != expected_uid || clst.file_type().is_symlink() {
+                    continue;
+                }
+                if clst.file_type().is_dir() {
+                    remove_owned_dir_recursive(&child_path, expected_uid, max_depth - 1);
+                } else if clst.file_type().is_file() {
+                    let _ = fs::remove_file(&child_path);
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir(path);
+}
+
+/// Safely purge all local CLI artifacts created by a temporary priming prompt (`-p hi`)
+/// so that `/resume` and `agy -c` are never polluted by auto-priming conversations.
+pub fn purge_priming_conversation(
+    home_dir: &Path,
+    conversation_id: &str,
+    real_home: Option<&Path>,
+) -> Result<(), SecurityError> {
+    let cid = validate_uuid(conversation_id.trim())?;
+    let verified_home = verify_safe_home_dir(home_dir, real_home)?;
+    let uid = current_uid()?;
+
+    let gemini_dir = verified_home.join(".gemini");
+    let cli_dir = gemini_dir.join("antigravity-cli");
+    for anc in [&gemini_dir, &cli_dir] {
+        let Ok(lst) = fs::symlink_metadata(anc) else {
+            return Ok(());
+        };
+        if lst.file_type().is_symlink() || !lst.file_type().is_dir() || lst.uid() != uid {
+            return Err(SecurityError(format!(
+                "Untrusted CLI directory: {}",
+                anc.display()
+            )));
+        }
+    }
+
+    let conv_dir = cli_dir.join("conversations");
+    if let Ok(lst) = fs::symlink_metadata(&conv_dir) {
+        if !lst.file_type().is_symlink() && lst.file_type().is_dir() && lst.uid() == uid {
+            for ext in ["db", "db-wal", "db-shm"] {
+                remove_owned_regular_file(&conv_dir.join(format!("{cid}.{ext}")), uid);
+            }
+        }
+    }
+
+    let ann_dir = cli_dir.join("annotations");
+    if let Ok(lst) = fs::symlink_metadata(&ann_dir) {
+        if !lst.file_type().is_symlink() && lst.file_type().is_dir() && lst.uid() == uid {
+            remove_owned_regular_file(&ann_dir.join(format!("{cid}.pbtxt")), uid);
+        }
+    }
+
+    let pres_dir = cli_dir.join("presence");
+    if let Ok(lst) = fs::symlink_metadata(&pres_dir) {
+        if !lst.file_type().is_symlink() && lst.file_type().is_dir() && lst.uid() == uid {
+            remove_owned_regular_file(&pres_dir.join(format!("{cid}.lock")), uid);
+        }
+    }
+
+    let brain_dir = cli_dir.join("brain");
+    if let Ok(lst) = fs::symlink_metadata(&brain_dir) {
+        if !lst.file_type().is_symlink() && lst.file_type().is_dir() && lst.uid() == uid {
+            remove_owned_dir_recursive(&brain_dir.join(cid), uid, 5);
+        }
+    }
+
+    let cache_dir = cli_dir.join("cache");
+    if let Ok(Some(serde_json::Value::Object(mut map))) =
+        safe_read_json(&cache_dir, "last_conversations.json", 65_536)
+    {
+        let before_len = map.len();
+        map.retain(|_, v| v.as_str() != Some(cid));
+        if map.len() != before_len {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(map)) {
+                let _ = atomic_write_json(&cache_dir, "last_conversations.json", &bytes);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Atomically write JSON bytes into a validated `0700` directory using `O_EXCL | O_NOFOLLOW` (`0600`).
 pub fn atomic_write_json(dir_path: &Path, filename: &str, json_bytes: &[u8]) -> Result<PathBuf, SecurityError> {
     validate_json_filename(filename)?;

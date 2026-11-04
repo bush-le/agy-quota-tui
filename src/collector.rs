@@ -18,8 +18,8 @@ use crate::models::{
 use crate::profiles::locate_agy_binary;
 use crate::security::{
     atomic_write_json, build_isolated_command, build_isolated_prime_command, get_safe_cache_dir,
-    get_safe_empty_workspace, kill_process_group, redact_sensitive_text, safe_read_json,
-    sanitize_terminal_text,
+    get_safe_empty_workspace, kill_process_group, purge_priming_conversation,
+    redact_sensitive_text, safe_read_json, sanitize_terminal_text,
 };
 
 pub const MAX_SUBPROCESS_OUTPUT_BYTES: u64 = 262_144; // 256 KB hard cap
@@ -363,6 +363,20 @@ fn query_usage_once(
     parse_usage_json(&stdout_str, profile, Some(now_epoch_secs()))
 }
 
+fn extract_conversation_id_from_stdout(raw_stdout: &str) -> Option<String> {
+    let start_idx = raw_stdout.find('{')?;
+    let end_idx = raw_stdout.rfind('}')?;
+    if end_idx < start_idx {
+        return None;
+    }
+    let val: Value = serde_json::from_str(&raw_stdout[start_idx..=end_idx]).ok()?;
+    val.get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn prime_single_group(
     profile: &ProfileSpec,
     agy_bin: &Path,
@@ -370,10 +384,11 @@ fn prime_single_group(
     model_name: &str,
     real_home: Option<&Path>,
 ) -> bool {
+    let home_path = Path::new(&profile.home_dir);
     let Ok((argv, clean_env)) = build_isolated_prime_command(
         &profile.mode,
         agy_bin,
-        Path::new(&profile.home_dir),
+        home_path,
         profile.container.as_deref(),
         model_name,
         real_home,
@@ -382,7 +397,12 @@ fn prime_single_group(
     };
 
     match run_bounded_subprocess(&argv, &clean_env, empty_cwd) {
-        Ok((status, stdout_str, _)) => status.success() || stdout_str.contains("\"SUCCESS\""),
+        Ok((status, stdout_str, _)) => {
+            if let Some(cid) = extract_conversation_id_from_stdout(&stdout_str) {
+                let _ = purge_priming_conversation(home_path, &cid, real_home);
+            }
+            status.success() || stdout_str.contains("\"SUCCESS\"")
+        }
         Err(_) => false,
     }
 }
