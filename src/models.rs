@@ -200,6 +200,91 @@ impl GroupQuota {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub conversation_id: String,
+    pub title: String,
+    pub step_count: u32,
+    pub last_modified_epoch: f64,
+    pub workspace_dir: String,
+}
+
+impl SessionSummary {
+    pub fn short_id(&self) -> &str {
+        match self.conversation_id.char_indices().nth(8) {
+            Some((idx, _)) => &self.conversation_id[..idx],
+            None => &self.conversation_id,
+        }
+    }
+
+    pub fn format_relative_age(&self, now_epoch: f64) -> String {
+        if self.last_modified_epoch <= 0.0 || safe_epoch(Some(self.last_modified_epoch)).is_none() {
+            return "—".to_string();
+        }
+        let diff = (now_epoch - self.last_modified_epoch).max(0.0) as i64;
+        if diff < 60 {
+            "<1m".to_string()
+        } else if diff < 3600 {
+            format!("{}m", diff / 60)
+        } else if diff < 86400 {
+            format!("{}h", diff / 3600)
+        } else {
+            format!("{}d", diff / 86400)
+        }
+    }
+
+    pub fn display_workspace(&self, real_home: Option<&std::path::Path>) -> String {
+        let trimmed = self.workspace_dir.trim();
+        if trimmed.is_empty() {
+            return "~".to_string();
+        }
+        if let Some(h) = real_home {
+            let h_str = h.to_string_lossy();
+            if trimmed == h_str.as_ref() {
+                return "~".to_string();
+            }
+            if let Some(rest) = trimmed.strip_prefix(h_str.as_ref()) {
+                if rest.is_empty() {
+                    return "~".to_string();
+                }
+                if rest.starts_with('/') {
+                    return format!("~{rest}");
+                }
+            }
+        }
+        redact_sensitive_text(trimmed, 60)
+    }
+
+    pub fn from_json_value(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let raw_id = obj.get("conversation_id").and_then(Value::as_str)?;
+        let conversation_id = crate::security::validate_uuid(raw_id.trim()).ok()?.to_string();
+        let title = sanitize_terminal_text(
+            obj.get("title").and_then(Value::as_str).unwrap_or(""),
+            80,
+        );
+        let step_count = obj
+            .get("step_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        let last_modified_epoch =
+            safe_epoch(obj.get("last_modified_epoch").and_then(Value::as_f64)).unwrap_or(0.0);
+        let workspace_dir = sanitize_terminal_text(
+            obj.get("workspace_dir").and_then(Value::as_str).unwrap_or(""),
+            160,
+        );
+
+        Some(Self {
+            conversation_id,
+            title,
+            step_count,
+            last_modified_epoch,
+            workspace_dir,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountSnapshot {
     pub profile_id: String,
     pub label: String,
@@ -209,6 +294,8 @@ pub struct AccountSnapshot {
     pub fetched_at_epoch: f64,
     pub groups: Vec<GroupQuota>,
     pub error: String,
+    #[serde(default)]
+    pub recent_sessions: Vec<SessionSummary>,
 }
 
 impl AccountSnapshot {
@@ -297,6 +384,16 @@ impl AccountSnapshot {
             .unwrap_or_default();
         let error =
             redact_sensitive_text(obj.get("error").and_then(Value::as_str).unwrap_or(""), 240);
+        let recent_sessions = obj
+            .get("recent_sessions")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .take(10)
+                    .filter_map(SessionSummary::from_json_value)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Some(Self {
             profile_id,
@@ -307,6 +404,7 @@ impl AccountSnapshot {
             fetched_at_epoch,
             groups,
             error,
+            recent_sessions,
         })
     }
 }

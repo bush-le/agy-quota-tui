@@ -31,11 +31,22 @@ pub fn parse_iso_timestamp(iso_str: &str) -> Option<f64> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        let ep = dt.timestamp_millis() as f64 / 1000.0;
-        return safe_epoch(Some(ep));
+    let dt = DateTime::parse_from_rfc3339(trimmed)
+        .or_else(|_| {
+            if trimmed.len() > 10 && trimmed.as_bytes()[10] == b' ' {
+                let normalized = format!("{}T{}", &trimmed[..10], &trimmed[11..]);
+                DateTime::parse_from_rfc3339(&normalized)
+            } else {
+                DateTime::parse_from_rfc3339(trimmed)
+            }
+        })
+        .ok()?;
+
+    let ep = dt.timestamp_millis() as f64 / 1000.0;
+    if ep < 946_684_800.0 {
+        return None;
     }
-    None
+    safe_epoch(Some(ep))
 }
 
 /// Validate and transform `agy -p /usage --output-format json` stdout into `AccountSnapshot`.
@@ -68,6 +79,7 @@ pub fn parse_usage_json(
             } else {
                 err
             },
+            recent_sessions: Vec::new(),
         };
     };
 
@@ -81,6 +93,7 @@ pub fn parse_usage_json(
             fetched_at_epoch: now,
             groups: Vec::new(),
             error: "Incomplete JSON output from agy CLI".to_string(),
+            recent_sessions: Vec::new(),
         };
     };
 
@@ -94,6 +107,7 @@ pub fn parse_usage_json(
             fetched_at_epoch: now,
             groups: Vec::new(),
             error: "Malformed JSON slice from agy CLI".to_string(),
+            recent_sessions: Vec::new(),
         };
     }
 
@@ -110,6 +124,7 @@ pub fn parse_usage_json(
                 fetched_at_epoch: now,
                 groups: Vec::new(),
                 error: format!("JSON parse error: {}", sanitize_terminal_text(&e.to_string(), 160)),
+                recent_sessions: Vec::new(),
             };
         }
     };
@@ -133,6 +148,7 @@ pub fn parse_usage_json(
             fetched_at_epoch: now,
             groups: Vec::new(),
             error: redact_sensitive_text(raw_err, 240),
+            recent_sessions: Vec::new(),
         };
     }
 
@@ -151,6 +167,7 @@ pub fn parse_usage_json(
             fetched_at_epoch: now,
             groups: Vec::new(),
             error: "No quota groups returned by CLI".to_string(),
+            recent_sessions: Vec::new(),
         };
     };
 
@@ -228,6 +245,7 @@ pub fn parse_usage_json(
         } else {
             "Empty quota buckets".to_string()
         },
+        recent_sessions: Vec::new(),
     }
 }
 
@@ -319,6 +337,7 @@ fn query_usage_once(
                 fetched_at_epoch: now,
                 groups: Vec::new(),
                 error: redact_sensitive_text(&e.to_string(), 240),
+                recent_sessions: Vec::new(),
             };
         }
     };
@@ -336,6 +355,7 @@ fn query_usage_once(
                     fetched_at_epoch: now_epoch_secs(),
                     groups: Vec::new(),
                     error: redact_sensitive_text(&err_msg, 240),
+                    recent_sessions: Vec::new(),
                 };
             }
         };
@@ -357,6 +377,7 @@ fn query_usage_once(
             fetched_at_epoch: now_epoch_secs(),
             groups: Vec::new(),
             error: redact_sensitive_text(&combined, 240),
+            recent_sessions: Vec::new(),
         };
     }
 
@@ -602,6 +623,7 @@ impl QuotaCollector {
                         fetched_at_epoch: now,
                         groups: Vec::new(),
                         error: redact_sensitive_text(&e.to_string(), 240),
+                        recent_sessions: Vec::new(),
                     })
                     .collect();
             }
@@ -623,6 +645,7 @@ impl QuotaCollector {
                         fetched_at_epoch: now,
                         groups: Vec::new(),
                         error: redact_sensitive_text(&e.to_string(), 240),
+                        recent_sessions: Vec::new(),
                     })
                     .collect();
             }
@@ -646,6 +669,7 @@ impl QuotaCollector {
                         fetched_at_epoch: now_epoch_secs(),
                         groups: Vec::new(),
                         error: "Worker thread panicked".to_string(),
+                        recent_sessions: Vec::new(),
                     })
                 })
                 .collect()
