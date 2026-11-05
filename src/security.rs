@@ -1331,3 +1331,234 @@ pub fn kill_process_group(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+pub const MAX_SQLITE_DB_BYTES: u64 = 67_108_864; // 64 MB
+pub const MAX_SQLITE_WAL_BYTES: u64 = 16_777_216; // 16 MB
+
+/// Safely open a verified read-only SQLite file (`conversation_summaries.db` or `.db-wal`)
+/// inside `<profile_home>/.gemini/antigravity-cli` with `O_NOFOLLOW`, ownership, hardlink, and size checks.
+pub fn open_verified_sqlite_file(
+    profile_home: &Path,
+    filename: &str,
+    max_bytes: u64,
+    real_home: Option<&Path>,
+) -> Result<Option<(File, u64)>, SecurityError> {
+    if filename != "conversation_summaries.db" && filename != "conversation_summaries.db-wal" {
+        return Err(SecurityError(format!(
+            "Disallowed SQLite filename: {filename}"
+        )));
+    }
+
+    let verified_home = verify_safe_home_dir(profile_home, real_home)?;
+    let uid = current_uid()?;
+
+    let gemini_dir = verified_home.join(".gemini");
+    let cli_dir = gemini_dir.join("antigravity-cli");
+    for anc in [&gemini_dir, &cli_dir] {
+        let lst = match fs::symlink_metadata(anc) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(SecurityError(format!(
+                    "Cannot lstat CLI directory {}: {e}",
+                    anc.display()
+                )))
+            }
+        };
+        if lst.file_type().is_symlink() {
+            return Err(SecurityError(format!(
+                "Refusing symlinked CLI directory: {}",
+                anc.display()
+            )));
+        }
+        if !lst.file_type().is_dir() {
+            return Err(SecurityError(format!(
+                "CLI path is not a directory: {}",
+                anc.display()
+            )));
+        }
+        if lst.uid() != uid {
+            return Err(SecurityError(format!(
+                "CLI directory {} owned by untrusted UID {}",
+                anc.display(),
+                lst.uid()
+            )));
+        }
+        if (lst.mode() & 0o022) != 0 {
+            return Err(SecurityError(format!(
+                "CLI directory {} is group/world-writable",
+                anc.display()
+            )));
+        }
+    }
+
+    let target = cli_dir.join(filename);
+    let lst = match fs::symlink_metadata(&target) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SecurityError(format!(
+                "Cannot lstat SQLite file {}: {e}",
+                target.display()
+            )))
+        }
+    };
+
+    if lst.file_type().is_symlink() {
+        return Err(SecurityError(format!(
+            "Refusing to read symlinked SQLite file: {}",
+            target.display()
+        )));
+    }
+    if !lst.file_type().is_file() {
+        return Err(SecurityError(format!(
+            "Refusing to read non-regular SQLite file: {}",
+            target.display()
+        )));
+    }
+    if lst.uid() != uid {
+        return Err(SecurityError(format!(
+            "SQLite file {} owned by untrusted UID {}",
+            target.display(),
+            lst.uid()
+        )));
+    }
+    if (lst.mode() & 0o022) != 0 {
+        return Err(SecurityError(format!(
+            "SQLite file {} is group/world-writable",
+            target.display()
+        )));
+    }
+
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW_FLAG)
+        .open(&target)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SecurityError(format!(
+                "Cannot open SQLite file {}: {e}",
+                target.display()
+            )))
+        }
+    };
+
+    let fst = file.metadata().map_err(|e| {
+        SecurityError(format!(
+            "fstat failed on SQLite file {}: {e}",
+            target.display()
+        ))
+    })?;
+    if !fst.file_type().is_file() || fst.uid() != uid {
+        return Err(SecurityError(format!(
+            "SQLite file descriptor validation failed for {}",
+            target.display()
+        )));
+    }
+    if fst.nlink() != 1 {
+        return Err(SecurityError(format!(
+            "Refusing to read hardlinked SQLite file (nlink={}): {}",
+            fst.nlink(),
+            target.display()
+        )));
+    }
+    if (fst.mode() & 0o022) != 0 {
+        return Err(SecurityError(format!(
+            "SQLite file descriptor for {} is group/world-writable",
+            target.display()
+        )));
+    }
+    if fst.len() > max_bytes {
+        return Err(SecurityError(format!(
+            "SQLite file {} exceeds maximum allowed size ({} > {max_bytes})",
+            target.display(),
+            fst.len()
+        )));
+    }
+
+    Ok(Some((file, fst.len())))
+}
+
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_uri_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = *bytes.get(idx)?;
+        let decoded = if b == b'%' {
+            let hi = decode_hex_nibble(*bytes.get(idx.checked_add(1)?)?)?;
+            let lo = decode_hex_nibble(*bytes.get(idx.checked_add(2)?)?)?;
+            idx = idx.checked_add(3)?;
+            (hi << 4) | lo
+        } else {
+            idx = idx.checked_add(1)?;
+            b
+        };
+        if decoded < 0x20 || decoded == 0x7f {
+            return None;
+        }
+        out.push(decoded);
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Parse `workspace_uris` JSON array (e.g. `["file:///..."]`) and verify the first workspace directory
+/// resides safely within `real_home`, falling back to `fallback_home` on any error or violation.
+pub fn verify_safe_workspace_dir(raw_workspace_uris_json: &str, real_home: Option<&Path>) -> PathBuf {
+    let base_candidate = match real_home {
+        Some(h) => h.to_path_buf(),
+        None => match get_real_home_dir() {
+            Ok(h) => h,
+            Err(_) => return PathBuf::from("~"),
+        },
+    };
+    let fallback_home = match verify_safe_home_dir(&base_candidate, real_home) {
+        Ok(h) => h,
+        Err(_) => return PathBuf::from("~"),
+    };
+
+    if raw_workspace_uris_json.len() > 2048 {
+        return fallback_home;
+    }
+
+    let Ok(uris) = serde_json::from_str::<Vec<String>>(raw_workspace_uris_json) else {
+        return fallback_home;
+    };
+    let Some(first_uri) = uris.first() else {
+        return fallback_home;
+    };
+    let Some(raw_path) = first_uri.strip_prefix("file://") else {
+        return fallback_home;
+    };
+    let Some(decoded) = percent_decode_uri_path(raw_path) else {
+        return fallback_home;
+    };
+
+    if decoded.contains("/usr/share/empty")
+        || decoded.contains("/var/empty")
+        || decoded.contains("empty-workspace")
+    {
+        return fallback_home;
+    }
+
+    let candidate_path = Path::new(&decoded);
+    if candidate_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return fallback_home;
+    }
+
+    verify_safe_home_dir(candidate_path, Some(&fallback_home)).unwrap_or(fallback_home)
+}
