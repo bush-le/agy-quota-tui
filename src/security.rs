@@ -14,10 +14,14 @@ use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::models::{ProfileSpec, SessionSummary};
 
 static TMP_FILE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1561,4 +1565,308 @@ pub fn verify_safe_workspace_dir(raw_workspace_uris_json: &str, real_home: Optio
     }
 
     verify_safe_home_dir(candidate_path, Some(&fallback_home)).unwrap_or(fallback_home)
+}
+
+fn is_safe_unquoted_path_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'~' | b'-')
+}
+
+/// Format a clean, copy-ready CLI command string for resuming a specific conversation.
+pub fn format_resume_command_string(
+    profile: &ProfileSpec,
+    session: &SessionSummary,
+    real_home: Option<&Path>,
+) -> String {
+    let cid = validate_uuid(session.conversation_id.trim())
+        .unwrap_or("00000000-0000-0000-0000-000000000000");
+    let cmd_hint = validate_identifier(&profile.command_hint, "command_hint").unwrap_or("agy");
+    let ws_display = session.display_workspace(real_home);
+
+    if ws_display == "~" || ws_display.is_empty() {
+        format!("{cmd_hint} --conversation {cid}")
+    } else if ws_display.bytes().all(is_safe_unquoted_path_byte) {
+        format!("cd {ws_display} && {cmd_hint} --conversation {cid}")
+    } else {
+        format!("{cmd_hint} --conversation {cid}")
+    }
+}
+
+/// Build the verified `(argv, outer_env, verified_workspace)` tuple to open a new `ptyxis` tab
+/// directly into `agy --conversation <uuid>` for the given profile mode (`host`, `isolated_home`, `toolbox`, `distrobox`).
+pub fn build_ptyxis_tab_command(
+    profile: &ProfileSpec,
+    session: &SessionSummary,
+    ptyxis_bin: &Path,
+    agy_bin: &Path,
+    real_home: Option<&Path>,
+) -> Result<(Vec<String>, BTreeMap<String, String>, PathBuf), SecurityError> {
+    let verified_ptyxis = verify_safe_executable(ptyxis_bin)?;
+    let verified_agy = verify_safe_executable(agy_bin)?;
+    let cid = validate_uuid(session.conversation_id.trim())?;
+
+    let base_home = match real_home {
+        Some(h) => verify_safe_home_dir(h, real_home)?,
+        None => {
+            let h = get_real_home_dir()?;
+            verify_safe_home_dir(&h, None)?
+        }
+    };
+
+    let verified_prof_home = verify_safe_home_dir(Path::new(&profile.home_dir), Some(&base_home))?;
+    let verified_ws = if session.workspace_dir.trim().is_empty() {
+        base_home.clone()
+    } else {
+        verify_safe_home_dir(Path::new(session.workspace_dir.trim()), Some(&base_home))
+            .unwrap_or_else(|_| base_home.clone())
+    };
+
+    let mut outer_env = build_host_env(Some(&base_home))?;
+    outer_env.insert("TERM".to_string(), "xterm-256color".to_string());
+    outer_env.insert("COLORTERM".to_string(), "truecolor".to_string());
+    outer_env.insert(
+        "PATH".to_string(),
+        format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin", base_home.display()),
+    );
+
+    if let Ok(val) = env::var("WAYLAND_DISPLAY") {
+        let trimmed = val.trim();
+        if validate_identifier(trimmed, "WAYLAND_DISPLAY").is_ok() {
+            outer_env.insert("WAYLAND_DISPLAY".to_string(), trimmed.to_string());
+        }
+    }
+    if let Ok(val) = env::var("DISPLAY") {
+        let trimmed = val.trim();
+        if trimmed.starts_with(':')
+            && trimmed.len() > 1
+            && trimmed.len() <= 16
+            && trimmed[1..].bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        {
+            outer_env.insert("DISPLAY".to_string(), trimmed.to_string());
+        }
+    }
+    if let Ok(val) = env::var("XDG_SESSION_TYPE") {
+        let trimmed = val.trim();
+        if trimmed == "wayland" || trimmed == "x11" {
+            outer_env.insert("XDG_SESSION_TYPE".to_string(), trimmed.to_string());
+        }
+    }
+    if let Ok(val) = env::var("XDG_CURRENT_DESKTOP") {
+        let trimmed = val.trim();
+        if validate_identifier(trimmed, "XDG_CURRENT_DESKTOP").is_ok() {
+            outer_env.insert("XDG_CURRENT_DESKTOP".to_string(), trimmed.to_string());
+        }
+    }
+
+    let safe_pid = validate_identifier(&profile.id, "profile.id").unwrap_or("agy");
+    let clean_title = sanitize_terminal_text(&session.title, 48);
+    let tab_title = format!(
+        "[{safe_pid}] {}",
+        if clean_title.is_empty() {
+            session.short_id()
+        } else {
+            &clean_title
+        }
+    );
+
+    let username = get_current_username();
+    let interactive_path = format!(
+        "PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        base_home.display()
+    );
+    let agy_str = verified_agy.to_string_lossy().into_owned();
+
+    let inner_argv: Vec<String> = match profile.mode.as_str() {
+        "host" => vec![agy_str, "--conversation".to_string(), cid.to_string()],
+        "isolated_home" => {
+            let env_bin = verify_safe_executable(Path::new("/usr/bin/env"))?;
+            vec![
+                env_bin.to_string_lossy().into_owned(),
+                "-i".to_string(),
+                format!("HOME={}", verified_prof_home.display()),
+                format!("USER={username}"),
+                format!("LOGNAME={username}"),
+                interactive_path,
+                "LANG=C.UTF-8".to_string(),
+                "TERM=xterm-256color".to_string(),
+                "COLORTERM=truecolor".to_string(),
+                "DBUS_SESSION_BUS_ADDRESS=".to_string(),
+                "SSH_CONNECTION=127.0.0.1 1234".to_string(),
+                agy_str,
+                "--conversation".to_string(),
+                cid.to_string(),
+            ]
+        }
+        "toolbox" | "distrobox" => {
+            let cname = profile.container.as_deref().ok_or_else(|| {
+                SecurityError(format!(
+                    "Mode '{}' requires a valid container name",
+                    profile.mode
+                ))
+            })?;
+            let safe_container = validate_identifier(cname, "container_name")?;
+            let runner_bin = verify_safe_executable(Path::new(&format!("/usr/bin/{}", profile.mode)))?;
+            let env_bin = verify_safe_executable(Path::new("/usr/bin/env"))?;
+
+            let mut cmd = Vec::with_capacity(20);
+            cmd.push(runner_bin.to_string_lossy().into_owned());
+            if profile.mode == "toolbox" {
+                cmd.push("run".to_string());
+                cmd.push("-c".to_string());
+                cmd.push(safe_container.to_string());
+            } else {
+                cmd.push("enter".to_string());
+                cmd.push(safe_container.to_string());
+                cmd.push("--".to_string());
+            }
+            cmd.push(env_bin.to_string_lossy().into_owned());
+            cmd.push("DBUS_SESSION_BUS_ADDRESS=".to_string());
+            cmd.push("SSH_CONNECTION=127.0.0.1 1234".to_string());
+            cmd.push("TERM=xterm-256color".to_string());
+            cmd.push("COLORTERM=truecolor".to_string());
+            cmd.push(format!("HOME={}", verified_prof_home.display()));
+            cmd.push(interactive_path);
+            cmd.push(agy_str);
+            cmd.push("--conversation".to_string());
+            cmd.push(cid.to_string());
+            cmd
+        }
+        other => {
+            return Err(SecurityError(format!(
+                "Unsupported profile execution mode: {other}"
+            )))
+        }
+    };
+
+    let mut argv = vec![
+        verified_ptyxis.to_string_lossy().into_owned(),
+        "--tab".to_string(),
+        format!("--working-directory={}", verified_ws.display()),
+        format!("--title={tab_title}"),
+        "--".to_string(),
+    ];
+    argv.extend(inner_argv);
+
+    Ok((argv, outer_env, verified_ws))
+}
+
+/// Spawn a non-blocking `ptyxis --tab` session for the selected profile and conversation,
+/// reaping the child process on a background thread so no zombie process is ever left behind.
+pub fn spawn_ptyxis_session_tab(
+    profile: &ProfileSpec,
+    session: &SessionSummary,
+    real_home: Option<&Path>,
+) -> Result<(), SecurityError> {
+    let agy_bin = crate::profiles::locate_agy_binary(real_home)?;
+    let (argv, outer_env, verified_ws) = build_ptyxis_tab_command(
+        profile,
+        session,
+        Path::new("/usr/bin/ptyxis"),
+        &agy_bin,
+        real_home,
+    )?;
+
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&verified_ws)
+        .env_clear()
+        .envs(&outer_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| SecurityError(format!("Failed to launch ptyxis tab: {e}")))?;
+
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    Ok(())
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Copy single-line sanitized text to the Wayland clipboard via `/usr/bin/wl-copy` (or OSC-52 fallback).
+pub fn copy_to_clipboard(text: &str, real_home: Option<&Path>) -> Result<(), SecurityError> {
+    if text.is_empty() || text.len() > 4096 || text.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(SecurityError(
+            "Refusing to copy empty or control-character-tainted text to clipboard".to_string(),
+        ));
+    }
+
+    if let Ok(verified_wl_copy) = verify_safe_executable(Path::new("/usr/bin/wl-copy")) {
+        if let (Ok(mut env_map), Ok(empty_cwd)) =
+            (build_host_env(real_home), get_safe_empty_workspace(real_home))
+        {
+            if let Ok(val) = env::var("WAYLAND_DISPLAY") {
+                let trimmed = val.trim();
+                if validate_identifier(trimmed, "WAYLAND_DISPLAY").is_ok() {
+                    env_map.insert("WAYLAND_DISPLAY".to_string(), trimmed.to_string());
+                }
+            }
+            if let Ok(mut child) = Command::new(verified_wl_copy)
+                .current_dir(empty_cwd)
+                .env_clear()
+                .envs(&env_map)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let start = Instant::now();
+                let ok = loop {
+                    match child.try_wait() {
+                        Ok(Some(st)) => break st.success(),
+                        Ok(None) => {
+                            if start.elapsed() >= Duration::from_millis(1500) {
+                                kill_process_group(&mut child);
+                                break false;
+                            }
+                            thread::sleep(Duration::from_millis(15));
+                        }
+                        Err(_) => {
+                            kill_process_group(&mut child);
+                            break false;
+                        }
+                    }
+                };
+                if ok {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let b64 = encode_base64(text.as_bytes());
+    let osc52 = format!("\x1b]52;c;{b64}\x07");
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(osc52.as_bytes());
+    let _ = stdout.flush();
+    Ok(())
 }
