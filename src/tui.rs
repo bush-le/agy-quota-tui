@@ -28,8 +28,13 @@ use ratatui::{
 use crate::collector::{compute_recommendations, QuotaCollector};
 use crate::models::{
     format_epoch_hms, now_epoch_secs, safe_fraction, AccountSnapshot, BucketQuota, ProfileSpec,
+    SessionSummary,
 };
 use crate::profiles::{save_user_preferences, AppConfig, ALLOWED_THEMES};
+use crate::security::{
+    copy_to_clipboard, format_resume_command_string, redact_sensitive_text,
+    spawn_ptyxis_session_tab,
+};
 
 pub const POLL_INTERVAL_CHOICES: [u64; 3] = [120, 300, 900];
 
@@ -134,6 +139,8 @@ pub struct DashboardState {
     pub next_poll_epoch: f64,
     pub toast: Option<(String, Instant)>,
     pub expired_triggered: BTreeSet<(String, String, i64)>,
+    pub selected_profile_idx: usize,
+    pub selected_session_idx: BTreeMap<String, usize>,
 }
 
 impl DashboardState {
@@ -156,6 +163,8 @@ impl DashboardState {
             last_sync_epoch: last_sync,
             toast: None,
             expired_triggered: BTreeSet::new(),
+            selected_profile_idx: 0,
+            selected_session_idx: BTreeMap::new(),
         }
     }
 
@@ -164,6 +173,85 @@ impl DashboardState {
             .iter()
             .filter_map(|p| self.snapshots.get(&p.id).cloned())
             .collect()
+    }
+
+    pub fn select_next_profile(&mut self) {
+        if !self.profiles.is_empty() {
+            self.selected_profile_idx = (self.selected_profile_idx + 1) % self.profiles.len();
+        }
+    }
+
+    pub fn select_prev_profile(&mut self) {
+        if !self.profiles.is_empty() {
+            self.selected_profile_idx = if self.selected_profile_idx == 0 {
+                self.profiles.len() - 1
+            } else {
+                self.selected_profile_idx - 1
+            };
+        }
+    }
+
+    pub fn select_profile_by_number(&mut self, one_based: usize) {
+        if one_based >= 1 && one_based <= self.profiles.len() {
+            self.selected_profile_idx = one_based - 1;
+        }
+    }
+
+    pub fn select_next_session(&mut self) {
+        let Some(prof) = self.profiles.get(self.selected_profile_idx) else {
+            return;
+        };
+        let Some(snap) = self.snapshots.get(&prof.id) else {
+            return;
+        };
+        let len = snap.recent_sessions.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self
+            .selected_session_idx
+            .get(&prof.id)
+            .copied()
+            .unwrap_or(0)
+            .min(len - 1);
+        let next = (cur + 1) % len;
+        self.selected_session_idx.insert(prof.id.clone(), next);
+    }
+
+    pub fn select_prev_session(&mut self) {
+        let Some(prof) = self.profiles.get(self.selected_profile_idx) else {
+            return;
+        };
+        let Some(snap) = self.snapshots.get(&prof.id) else {
+            return;
+        };
+        let len = snap.recent_sessions.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self
+            .selected_session_idx
+            .get(&prof.id)
+            .copied()
+            .unwrap_or(0)
+            .min(len - 1);
+        let prev = if cur == 0 { len - 1 } else { cur - 1 };
+        self.selected_session_idx.insert(prof.id.clone(), prev);
+    }
+
+    pub fn selected_session(&self) -> Option<(&ProfileSpec, &SessionSummary)> {
+        let prof = self.profiles.get(self.selected_profile_idx)?;
+        let snap = self.snapshots.get(&prof.id)?;
+        if snap.recent_sessions.is_empty() {
+            return None;
+        }
+        let idx = self
+            .selected_session_idx
+            .get(&prof.id)
+            .copied()
+            .unwrap_or(0)
+            .min(snap.recent_sessions.len() - 1);
+        Some((prof, &snap.recent_sessions[idx]))
     }
 
     pub fn toggle_filter(&mut self) {
@@ -262,6 +350,23 @@ fn pad_group_name(name: &str, target_width: usize) -> String {
     }
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else if max_chars == 1 {
+        "…".to_string()
+    } else {
+        let mut s: String = text.chars().take(max_chars - 1).collect();
+        s.push('…');
+        s
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_account_card(
     frame: &mut Frame,
     area: Rect,
@@ -272,19 +377,25 @@ fn render_account_card(
     only_5h: bool,
     is_best: bool,
     is_syncing: bool,
+    is_focused: bool,
+    selected_session_idx: usize,
     pal: &ThemePalette,
 ) {
     let sync_mark = if is_syncing { " [SYNC]" } else { "" };
+    let focus_prefix = if is_focused { "▸ " } else { "" };
 
     let Some(snap) = snap_opt else {
+        let border_col = if is_focused { pal.cyan } else { pal.muted };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(pal.muted))
+            .border_style(Style::default().fg(border_col))
             .style(Style::default().bg(pal.panel_bg).fg(pal.fg))
             .title(Span::styled(
-                format!(" [{idx}] {} · Loading... ", prof.label),
-                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+                format!(" {focus_prefix}[{idx}] {} · Loading... ", prof.label),
+                Style::default()
+                    .fg(if is_focused { pal.cyan } else { pal.fg })
+                    .add_modifier(Modifier::BOLD),
             ));
         let p = Paragraph::new(vec![
             Line::from(""),
@@ -299,7 +410,7 @@ fn render_account_card(
     };
 
     let state = snap.health_state();
-    let (badge, border_color) = if !snap.ok {
+    let (badge, base_border_color) = if !snap.ok {
         ("ERR", pal.crit)
     } else if is_best && state == "ok" {
         ("BEST", pal.best)
@@ -310,16 +421,23 @@ fn render_account_card(
     } else {
         ("OK", pal.accent)
     };
+    let border_color = if is_focused {
+        pal.cyan
+    } else {
+        base_border_color
+    };
 
     let title_line = Line::from(vec![
         Span::styled(
-            format!(" [{idx}] {} · ", snap.label),
-            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            format!(" {focus_prefix}[{idx}] {} · ", snap.label),
+            Style::default()
+                .fg(if is_focused { pal.cyan } else { pal.fg })
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{badge}{sync_mark} "),
             Style::default()
-                .fg(border_color)
+                .fg(base_border_color)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -366,7 +484,7 @@ fn render_account_card(
 
     let name_width = if area.width >= 42 { 16 } else { 13 };
     let bar_width = if area.width >= 44 { 10 } else { 8 };
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(16);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(24);
 
     let buckets_5h = snap.all_buckets(true);
     if !buckets_5h.is_empty() {
@@ -417,6 +535,103 @@ fn render_account_card(
                 ));
                 lines.push(Line::from(row_spans));
                 lines.push(build_reset_line(b, now_epoch, pal));
+            }
+        }
+    }
+
+    // Quota-First Layout Invariant: only render RECENT SESSIONS in remaining vertical space
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let remaining_lines = inner_height.saturating_sub(lines.len());
+
+    if remaining_lines >= 3 {
+        lines.push(Line::from(""));
+        let mut hdr_spans = vec![
+            Span::styled(
+                " RECENT SESSIONS",
+                Style::default().fg(pal.cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", snap.recent_sessions.len()),
+                Style::default().fg(pal.muted),
+            ),
+        ];
+        if is_focused && !snap.recent_sessions.is_empty() && inner_width >= 36 {
+            hdr_spans.push(Span::styled(
+                " · Enter:Open c:Copy",
+                Style::default().fg(pal.muted),
+            ));
+        }
+        lines.push(Line::from(hdr_spans));
+
+        let avail_rows = remaining_lines.saturating_sub(2);
+        if snap.recent_sessions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No recent sessions",
+                Style::default().fg(pal.muted),
+            )));
+        } else {
+            let lines_per_item = if avail_rows >= 6 { 2 } else { 1 };
+            let max_visible = (avail_rows / lines_per_item).max(1);
+            let clamped_sel =
+                selected_session_idx.min(snap.recent_sessions.len().saturating_sub(1));
+            let start_item = if clamped_sel >= max_visible {
+                clamped_sel + 1 - max_visible
+            } else {
+                0
+            };
+
+            for (s_idx, sess) in snap
+                .recent_sessions
+                .iter()
+                .enumerate()
+                .skip(start_item)
+                .take(max_visible)
+            {
+                let is_sel = is_focused && s_idx == clamped_sel;
+                let age = sess.format_relative_age(now_epoch);
+                let prefix = if is_sel { " ▸ " } else { "   " };
+                let age_suffix = format!(" {age}");
+                let max_title_chars = inner_width
+                    .saturating_sub(3 + age_suffix.chars().count() + 1)
+                    .max(4);
+                let title_trunc = truncate_chars(&sess.title, max_title_chars);
+
+                let title_style = if is_sel {
+                    Style::default()
+                        .fg(pal.bg)
+                        .bg(pal.cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(pal.fg)
+                };
+                let prefix_style = if is_sel {
+                    Style::default().fg(pal.cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(pal.muted)
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(title_trunc, title_style),
+                    Span::styled(age_suffix, Style::default().fg(pal.muted)),
+                ]));
+
+                if lines_per_item == 2 {
+                    let meta_raw = format!(
+                        "     {} · {}st · {}",
+                        sess.display_workspace(None),
+                        sess.step_count,
+                        sess.short_id()
+                    );
+                    let meta_trunc = truncate_chars(&meta_raw, inner_width.max(4));
+                    let meta_style = if is_sel {
+                        Style::default().fg(pal.cyan)
+                    } else {
+                        Style::default().fg(pal.muted)
+                    };
+                    lines.push(Line::from(Span::styled(meta_trunc, meta_style)));
+                }
             }
         }
     }
@@ -555,6 +770,9 @@ pub fn render_dashboard(frame: &mut Frame, state: &DashboardState) {
         .split(cards_area);
 
     let only_5h = state.config.filter_mode == "5h";
+    let focused_idx = state
+        .selected_profile_idx
+        .min(state.profiles.len().saturating_sub(1));
     for r in 0..rows {
         let start_idx = r * cols;
         let end_idx = (start_idx + cols).min(state.profiles.len());
@@ -568,18 +786,27 @@ pub fn render_dashboard(frame: &mut Frame, state: &DashboardState) {
             .split(row_rects[r]);
 
         for (c_idx, prof) in slice.iter().enumerate() {
+            let flat_idx = start_idx + c_idx;
             let snap_opt = state.snapshots.get(&prof.id);
             let is_best = top_ids.contains(&prof.id);
+            let is_focused = flat_idx == focused_idx;
+            let sel_sess_idx = state
+                .selected_session_idx
+                .get(&prof.id)
+                .copied()
+                .unwrap_or(0);
             render_account_card(
                 frame,
                 col_rects[c_idx],
-                start_idx + c_idx + 1,
+                flat_idx + 1,
                 prof,
                 snap_opt,
                 now_epoch,
                 only_5h,
                 is_best,
                 state.is_syncing,
+                is_focused,
+                sel_sess_idx,
                 &pal,
             );
         }
@@ -587,6 +814,30 @@ pub fn render_dashboard(frame: &mut Frame, state: &DashboardState) {
 
     // 4. Bottom Keybindings & Toast Footer
     let mut footer_spans = vec![
+        Span::styled(
+            " ←/→/↑/↓ ",
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Select  ", Style::default().fg(pal.fg)),
+        Span::styled(
+            " Enter ",
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.best)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Open Tab  ", Style::default().fg(pal.fg)),
+        Span::styled(
+            " c ",
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Copy Resume  ", Style::default().fg(pal.fg)),
         Span::styled(
             " r ",
             Style::default()
@@ -754,6 +1005,70 @@ pub fn run_live_tui(collector: Arc<QuotaCollector>, config: AppConfig) -> io::Re
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::BackTab => {
+                        state.select_prev_profile();
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Tab => {
+                        state.select_next_profile();
+                    }
+                    KeyCode::Char(d @ '1'..='9') => {
+                        state.select_profile_by_number((d as usize) - ('0' as usize));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                        state.select_prev_session();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                        state.select_next_session();
+                    }
+                    KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => {
+                        if let Some((prof, sess)) =
+                            state.selected_session().map(|(p, s)| (p.clone(), s.clone()))
+                        {
+                            match spawn_ptyxis_session_tab(&prof, &sess, None) {
+                                Ok(()) => {
+                                    state.toast = Some((
+                                        format!(
+                                            "Opened {} ({}) in new Ptyxis tab",
+                                            sess.short_id(),
+                                            prof.command_hint
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    state.toast = Some((
+                                        format!(
+                                            "Open failed: {}",
+                                            redact_sensitive_text(&e.to_string(), 80)
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some((prof, sess)) =
+                            state.selected_session().map(|(p, s)| (p.clone(), s.clone()))
+                        {
+                            let cmd_str = format_resume_command_string(&prof, &sess, None);
+                            match copy_to_clipboard(&cmd_str, None) {
+                                Ok(()) => {
+                                    state.toast =
+                                        Some((format!("Copied: {cmd_str}"), Instant::now()));
+                                }
+                                Err(e) => {
+                                    state.toast = Some((
+                                        format!(
+                                            "Clipboard error: {}",
+                                            redact_sensitive_text(&e.to_string(), 80)
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
                         if state.is_syncing {
                             state.toast = Some((
