@@ -59,3 +59,6 @@ profiles.json
 .DS_Store
 Thumbs.db
 scratch/
+
+# ADR-018 Hot Context Isolation
+.noesis-context.md
