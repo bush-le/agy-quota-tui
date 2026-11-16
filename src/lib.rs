@@ -141,7 +141,7 @@ pub fn run_cli() -> i32 {
                 return Ok(0);
             }
 
-            render_snapshot_to_stdout(&snapshots, config.filter_mode == "5h");
+            render_snapshot_to_stdout(&snapshots, config.filter_mode == "5h", &config.theme);
             return Ok(0);
         }
 

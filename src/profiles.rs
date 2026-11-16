@@ -22,12 +22,14 @@ use crate::security::{
 };
 
 pub const ALLOWED_MODES: [&str; 4] = ["host", "toolbox", "distrobox", "isolated_home"];
-pub const ALLOWED_THEMES: [&str; 5] = [
+pub const ALLOWED_THEMES: [&str; 7] = [
     "tokyo-night",
     "catppuccin-mocha",
     "dracula",
     "nord",
     "gruvbox",
+    "github-light-high-contrast",
+    "catppuccin-latte",
 ];
 pub const ALLOWED_FILTER_MODES: [&str; 2] = ["all", "5h"];
 
